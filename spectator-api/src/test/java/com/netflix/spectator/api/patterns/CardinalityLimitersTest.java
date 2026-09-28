@@ -1,0 +1,561 @@
+/*
+ * Copyright 2014-2019 Netflix, Inc.
+ * <p>
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.netflix.spectator.api.patterns;
+
+import com.netflix.spectator.api.ManualClock;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.Function;
+
+public class CardinalityLimitersTest {
+
+  @Test
+  public void first2() {
+    Function<String, String> f = CardinalityLimiters.first(2);
+    Assertions.assertEquals("a", f.apply("a"));
+    Assertions.assertEquals("b", f.apply("b"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, f.apply("c"));
+    Assertions.assertEquals("a", f.apply("a"));
+  }
+
+  @Test
+  public void firstToStringEmpty() {
+    Function<String, String> f = CardinalityLimiters.first(2);
+    Assertions.assertEquals("FirstLimiter()", f.toString());
+  }
+
+  @Test
+  public void firstToStringPartial() {
+    Function<String, String> f = CardinalityLimiters.first(2);
+    Assertions.assertEquals("b", f.apply("b"));
+    Assertions.assertEquals("FirstLimiter(b)", f.toString());
+  }
+
+  @Test
+  public void firstToStringFull() {
+    Function<String, String> f = CardinalityLimiters.first(2);
+    Assertions.assertEquals("a", f.apply("a"));
+    Assertions.assertEquals("b", f.apply("b"));
+    Assertions.assertEquals("FirstLimiter(a,b)", f.toString());
+  }
+
+  private void updateN(Function<String, String> f, int n, String s) {
+    for (int i = 0; i < n; ++i) {
+      f.apply(s);
+    }
+  }
+
+  private void advanceClock(ManualClock clock) {
+    long t = clock.wallTime();
+    clock.setWallTime(t + 10 * 60000 + 1);
+  }
+
+  @Test
+  public void mostFrequentUnderLimit() {
+    int n = 27;
+    ManualClock clock = new ManualClock(0L, 0L);
+    Function<String, String> f = CardinalityLimiters.mostFrequent(n, clock);
+    for (int t = 0; t < 1000; ++t) {
+      for (int i = 0; i < n; ++i) {
+        Assertions.assertEquals("" + i, f.apply("" + i));
+      }
+      clock.setWallTime(t * 1000);
+    }
+  }
+
+  @Test
+  public void mostFrequentIsUsed() {
+    ManualClock clock = new ManualClock(0L, 0L);
+    Function<String, String> f = CardinalityLimiters.mostFrequent(2, clock);
+
+    // Setup some basic stats
+    updateN(f, 4, "a");
+    updateN(f, 3, "b");
+    updateN(f, 2, "c");
+    updateN(f, 1, "d");
+
+    // Refresh cutoff, should be 3 for the top 2
+    advanceClock(clock);
+    Assertions.assertEquals("a", f.apply("a"));
+
+    // If the values are close then bias towards the names that come first alphabetically
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, f.apply("c"));
+    Assertions.assertEquals("b", f.apply("b"));
+
+    // Until the cutoff is updated, "d" won't show up no matter how frequent
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, f.apply("d"));
+    updateN(f, 42, "d");
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, f.apply("d"));
+
+    // Now "d" is most frequent
+    advanceClock(clock);
+    Assertions.assertEquals("d", f.apply("d"));
+  }
+
+  @Test
+  public void mostFrequentAllUnique() {
+    // Ensure we have a somewhat stable set and there isn't a memory leak if every value is
+    // unique. For example, if a user tried to use a request id.
+    ManualClock clock = new ManualClock(0L, 0L);
+    Function<String, String> f = CardinalityLimiters.mostFrequent(2, clock);
+    Set<String> values = new TreeSet<>();
+    for (int i = 0; i < 10000; ++i) {
+      values.add(f.apply("" + i));
+      clock.setWallTime(i * 1000);
+    }
+    // The values less than equal 9616 should have been cleaned up based on the clock
+    Assertions.assertFalse(f.toString().contains("9616"));
+    Assertions.assertEquals(3, values.size());
+  }
+
+  @Test
+  public void mostFrequentTransitionTime() {
+    // Ensure we have a somewhat stable set and there isn't a memory leak if every value is
+    // unique. For example, if a user tried to use a request id.
+    ManualClock clock = new ManualClock(0L, 0L);
+    Function<String, String> f = CardinalityLimiters.mostFrequent(2, clock);
+    Set<String> values = new TreeSet<>();
+
+    // Lots of activity on old asg
+    long i = 0;
+    for (; i < 1_000_000; ++i) {
+      values.add(f.apply("app-a-v001"));
+      values.add(f.apply("app-b-v001"));
+      clock.setWallTime(i * 1000);
+    }
+
+    // Activity moved to new asg
+    for (; i < 2_000_000; ++i) {
+      values.add(f.apply("app-a-v002"));
+      values.add(f.apply("app-b-v001"));
+      clock.setWallTime(i * 1000);
+    }
+
+    Assertions.assertTrue(values.contains("app-a-v002"));
+  }
+
+  @Test
+  public void mostFrequentTemporaryChurn() {
+    ManualClock clock = new ManualClock(0L, 0L);
+    Function<String, String> f = CardinalityLimiters.mostFrequent(2, clock);
+    Set<String> values = new TreeSet<>();
+    for (int t = 0; t < 250; ++t) {
+      if (t < 100) {
+        values.add(f.apply("a"));
+      } else if (t < 117) {
+        // Simulates 17 minutes of high churn
+        for (int i = 0; i < 200; ++i) {
+          values.add(f.apply("" + i));
+        }
+      } else {
+        // This should come through within 2h
+        values.add(f.apply("b"));
+      }
+      clock.setWallTime(t * 60000);
+    }
+    Assertions.assertEquals(6, values.size());
+    Assertions.assertEquals("b", f.apply("b"));
+  }
+
+  @Test
+  public void mostFrequentClusterUniform() {
+    // Simulate a cluster with independent limiters where high cardinality values are
+    // coming in round-robin to each node of the cluster.
+    int warmupEnd = 60;
+    int finalEnd = 24 * 60;
+    int cardinalityLimit = 25;
+    int clusterSize = 18;
+    int numValues = 2000;
+
+
+    // Ensure we have a somewhat stable set and there isn't a memory leak if every value is
+    // unique. For example, if a user tried to use a request id.
+    ManualClock clock = new ManualClock(0L, 0L);
+    List<Function<String, String>> limiters = new ArrayList<>();
+    for (int i = 0; i < clusterSize; ++i) {
+      limiters.add(CardinalityLimiters.mostFrequent(cardinalityLimit, clock));
+    }
+
+    Random r = new Random(42);
+    Set<String> values = new TreeSet<>();
+
+    Runnable singleIteration = () -> {
+      for (int v = 0; v < numValues; ++v) {
+        int n = r.nextInt(limiters.size());
+        Function<String, String> f = limiters.get(n);
+        values.add(f.apply("" + v));
+      }
+    };
+
+    int t = 0;
+    for (; t < warmupEnd; ++t) {
+      singleIteration.run();
+      clock.setWallTime(t * 60000);
+    }
+
+    // Should be proportional to the cluster size, not the number of input values
+    Assertions.assertTrue(values.size() < 2 * clusterSize * cardinalityLimit);
+
+    values.clear();
+    for (; t < finalEnd; ++t) {
+      singleIteration.run();
+      clock.setWallTime(t * 60000);
+    }
+
+    // Should only have the others value
+    Assertions.assertEquals(1, values.size());
+  }
+
+  @Test
+  public void mostFrequentClusterBiased() {
+    // Simulate a cluster with independent limiters where high cardinality values are
+    // coming in round-robin to each node of the cluster. There is a small set of more
+    // frequent values that should be preserved.
+    int warmupEnd = 12 * 60;
+    int finalEnd = 24 * 60;
+    int cardinalityLimit = 25;
+    int clusterSize = 18;
+    int numFrequentValues = 10;
+    int numValues = 2000;
+
+    // Setup a separate limiter for each node of the cluster
+    ManualClock clock = new ManualClock(0L, 0L);
+    List<Function<String, String>> limiters = new ArrayList<>();
+    for (int i = 0; i < clusterSize; ++i) {
+      limiters.add(CardinalityLimiters.mostFrequent(cardinalityLimit, clock));
+    }
+
+    Random r = new Random(42);
+    Set<String> values = new TreeSet<>();
+
+    Runnable singleIteration = () -> {
+      // Values with heavier use
+      for (int v = 0; v < numFrequentValues; ++v) {
+        for (int i = 0; i < 1 + v; ++i) {
+          int n = r.nextInt(limiters.size());
+          Function<String, String> f = limiters.get(n);
+          values.add(f.apply("" + v));
+        }
+      }
+
+      // Big tail of values with a lot of churn
+      for (int v = 0; v < numValues; ++v) {
+        int n = r.nextInt(limiters.size());
+        Function<String, String> f = limiters.get(n);
+        values.add(f.apply("" + v));
+      }
+    };
+
+    // Warmup phase, there will be a bit of a burst here, but it should stabilize quickly
+    // and start eliminating values with high amounts of churn
+    int t = 0;
+    for (; t < warmupEnd; ++t) {
+      singleIteration.run();
+      clock.setWallTime(t * 60000);
+    }
+
+    // Should be proportional to the cluster size, not the number of input values
+    Assertions.assertTrue(values.size() < 2 * clusterSize * cardinalityLimit);
+
+    // Stable phase, general trend is established and only higher frequency values should
+    // be reported with agreement for the most part across nodes
+    values.clear();
+    for (; t < finalEnd; ++t) {
+      singleIteration.run();
+      clock.setWallTime(t * 60000);
+    }
+
+    // It should have started converging on the frequent set and dropping the values with
+    // too much churn even though this restricts it below the specified limit.
+    Assertions.assertTrue(values.size() < 2 * numFrequentValues);
+  }
+
+  @Test
+  public void rollupNegative() {
+    Function<String, String> f = CardinalityLimiters.rollup(-2);
+    Assertions.assertEquals(CardinalityLimiters.AUTO_ROLLUP, f.apply("a"));
+    Assertions.assertEquals(CardinalityLimiters.AUTO_ROLLUP, f.apply("b"));
+  }
+
+  @Test
+  public void rollupZero() {
+    Function<String, String> f = CardinalityLimiters.rollup(0);
+    Assertions.assertEquals(CardinalityLimiters.AUTO_ROLLUP, f.apply("a"));
+    Assertions.assertEquals(CardinalityLimiters.AUTO_ROLLUP, f.apply("b"));
+  }
+
+  @Test
+  public void rollup2() {
+    Function<String, String> f = CardinalityLimiters.rollup(2);
+    Assertions.assertEquals("a", f.apply("a"));
+    Assertions.assertEquals("b", f.apply("b"));
+    Assertions.assertEquals(CardinalityLimiters.AUTO_ROLLUP, f.apply("c"));
+    Assertions.assertEquals(CardinalityLimiters.AUTO_ROLLUP, f.apply("a"));
+  }
+
+  @Test
+  public void registeredNameOrIp() {
+    Function<String, String> registeredNamelimiter = CardinalityLimiters.first(2);
+    Function<String, String> ipNamelimiter = CardinalityLimiters.first(2);
+    Function<String, String> limiter = CardinalityLimiters.registeredNameOrIp(registeredNamelimiter, ipNamelimiter);
+
+    //Allow two IPs
+    Assertions.assertEquals("127.0.0.1", limiter.apply("127.0.0.1"));
+    Assertions.assertEquals("[::1]", limiter.apply("[::1]"));
+
+    //Further IPs are limited
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("127.0.0.2"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("[::2]"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("[v1.::1]"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("[::1%0]"));
+
+    //Allow two registry names
+    Assertions.assertEquals("example.com", limiter.apply("example.com"));
+    Assertions.assertEquals("spectator", limiter.apply("spectator"));
+
+    //Further registry names are rolled up
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("subdomain.example.com"));
+
+    //Original IP are still allowed
+    Assertions.assertEquals("127.0.0.1", limiter.apply("127.0.0.1"));
+    Assertions.assertEquals("[::1]", limiter.apply("[::1]"));
+  }
+
+  @Test
+  public void registeredNameOrIpAnchorsIps() {
+    Function<String, String> registeredNamelimiter = CardinalityLimiters.first(4);
+    Function<String, String> ipNamelimiter = CardinalityLimiters.first(0);
+    Function<String, String> limiter = CardinalityLimiters.registeredNameOrIp(Function.identity(), s -> CardinalityLimiters.OTHERS);
+
+    //Confirm test setup that IPs limited
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("127.0.0.1"));
+
+    //IP-like registered names are allowed
+    Assertions.assertEquals("127.0.0.1.example.com", limiter.apply("127.0.0.1.example.com"));
+    Assertions.assertEquals("vip-127.0.0.1", limiter.apply("vip-127.0.0.1"));
+    Assertions.assertEquals("[::1]-vip", limiter.apply("[::1]-vip"));
+    Assertions.assertEquals("vip-[::1]", limiter.apply("vip-[::1]"));
+  }
+
+  @Test
+  public void registeredNameOrIpRemovesPort() {
+    Function<String, String> limiter =
+        CardinalityLimiters.registeredNameOrIp(Function.identity(), s -> CardinalityLimiters.OTHERS);
+
+    //Port is removed before classifying, so IPs with a port are still limited
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("127.0.0.1:80"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("[::1]:8080"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("ip-10-1-2-3.ec2.internal:80"));
+
+    //Port is also removed from registered names so it does not multiply the values
+    Assertions.assertEquals("example.com", limiter.apply("example.com:443"));
+    Assertions.assertEquals("example.com", limiter.apply("example.com"));
+  }
+
+  @Test
+  public void registeredNameOrIpPortEdgeCases() {
+    Function<String, String> limiter =
+        CardinalityLimiters.registeredNameOrIp(Function.identity(), s -> CardinalityLimiters.OTHERS);
+
+    //Unbracketed IPv6 is not truncated at the final colon
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("2001:db8::1"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("::1"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("::ffff:127.0.0.1"));
+
+    //A non-numeric or empty suffix is not a port and is left alone
+    Assertions.assertEquals("example.com:", limiter.apply("example.com:"));
+    Assertions.assertEquals("example.com:http", limiter.apply("example.com:http"));
+
+    //Malformed bracketed literals are left alone
+    Assertions.assertEquals("[::1", limiter.apply("[::1"));
+
+    //Empty input does not blow up
+    Assertions.assertEquals("", limiter.apply(""));
+  }
+
+  @Test
+  public void registeredNameOrIpEc2HostNames() {
+    Function<String, String> limiter =
+        CardinalityLimiters.registeredNameOrIp(Function.identity(), s -> CardinalityLimiters.OTHERS);
+
+    //IP-based names, private and public
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("ip-10-165-89-100.ec2.internal"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS,
+        limiter.apply("ip-100-114-41-206.us-west-2.compute.internal"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS,
+        limiter.apply("ec2-54-1-2-3.compute-1.amazonaws.com"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS,
+        limiter.apply("ec2-54-1-2-3.us-west-2.compute.amazonaws.com"));
+
+    //Resource-based names, the IPv6 equivalent
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("i-0123456789abcdef0.ec2.internal"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS,
+        limiter.apply("i-0123456789abcdef0.us-east-2.compute.internal"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("i-01234567.ec2.internal"));
+
+    //Names that merely start with a similar prefix are still registered names
+    Assertions.assertEquals("ios.prod.example.com", limiter.apply("ios.prod.example.com"));
+    Assertions.assertEquals("ip-service.example.com", limiter.apply("ip-service.example.com"));
+    Assertions.assertEquals("eks-cluster.example.com", limiter.apply("eks-cluster.example.com"));
+    Assertions.assertEquals("i-am-a-service.example.com", limiter.apply("i-am-a-service.example.com"));
+
+    //Too few hex characters to be an instance id
+    Assertions.assertEquals("i-abcdef.ec2.internal", limiter.apply("i-abcdef.ec2.internal"));
+
+    //Only the prefix is matched, so a wider trailing group still classifies as an IP. These
+    //are not real addresses, but they have the same per-instance cardinality.
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("ip-0-0-131-1503.example.com"));
+  }
+
+  @Test
+  public void registeredNameOrIpEc2HostNamesIgnoreCase() {
+    Function<String, String> limiter =
+        CardinalityLimiters.registeredNameOrIp(Function.identity(), s -> CardinalityLimiters.OTHERS);
+
+    //Host names are case insensitive, so an upper or mixed case EC2 name must not escape to
+    //the registered name limiter where there would be one value per instance
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("IP-10-1-2-3.EC2.INTERNAL"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("Ip-10-1-2-3.ec2.internal"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS,
+        limiter.apply("EC2-54-1-2-3.compute-1.amazonaws.com"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("I-0123456789ABCDEF0.ec2.internal"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("i-0123456789ABCDEF0.ec2.internal"));
+
+    //Case does not turn a registered name into an IP
+    Assertions.assertEquals("IP-SERVICE.example.com", limiter.apply("IP-SERVICE.example.com"));
+    Assertions.assertEquals("EKS-CLUSTER.example.com", limiter.apply("EKS-CLUSTER.example.com"));
+  }
+
+  @Test
+  public void registeredNameOrIpMalformedPortStillClassifiesAsIp() {
+    Function<String, String> limiter =
+        CardinalityLimiters.registeredNameOrIp(Function.identity(), s -> CardinalityLimiters.OTHERS);
+
+    //An empty or non-numeric port is not removed, but it must not stop the value from being
+    //recognised as an address, otherwise every distinct IP reaches the registered name limiter
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("127.0.0.1:"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("127.0.0.1:http"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("[::1]:"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("[::1]:http"));
+    Assertions.assertEquals(CardinalityLimiters.OTHERS, limiter.apply("ip-10-1-2-3.ec2.internal:http"));
+
+    //Registered names with the same shape are still registered names
+    Assertions.assertEquals("example.com:", limiter.apply("example.com:"));
+    Assertions.assertEquals("example.com:http", limiter.apply("example.com:http"));
+  }
+
+  @Test
+  public void registeredNameOrIpPassesHostToIpLimiter() {
+    //Both limiters echo their input so that the value handed to each one is observable, not
+    //just which of the two was selected
+    Function<String, String> limiter = CardinalityLimiters.registeredNameOrIp(
+        s -> "name:" + s, s -> "ip:" + s);
+
+    Assertions.assertEquals("ip:127.0.0.1", limiter.apply("127.0.0.1:80"));
+    Assertions.assertEquals("ip:[::1]", limiter.apply("[::1]:8080"));
+    Assertions.assertEquals("ip:ip-10-1-2-3.ec2.internal", limiter.apply("ip-10-1-2-3.ec2.internal:80"));
+    Assertions.assertEquals("name:example.com", limiter.apply("example.com:443"));
+
+    //Values without a port are passed through unchanged
+    Assertions.assertEquals("ip:2001:db8::1", limiter.apply("2001:db8::1"));
+    Assertions.assertEquals("name:example.com", limiter.apply("example.com"));
+  }
+
+  @Test
+  public void registeredNameOrIpLongColonRunIsNotQuadratic() {
+    Function<String, String> limiter =
+        CardinalityLimiters.registeredNameOrIp(Function.identity(), s -> CardinalityLimiters.OTHERS);
+
+    //A run of colons that cannot match the unbracketed IPv6 form must not backtrack. Matching
+    //this with overlapping [0-9A-Fa-f.:]* classes takes minutes for this input.
+    StringBuilder buf = new StringBuilder();
+    for (int i = 0; i < 4000; ++i) {
+      buf.append(':');
+    }
+    String value = buf.append('z').toString();
+    Assertions.assertTimeoutPreemptively(Duration.ofSeconds(5), () ->
+        Assertions.assertEquals(value, limiter.apply(value)));
+  }
+
+  @SuppressWarnings("unchecked")
+  static void checkSerde(Function<String, String> limiter) {
+    try {
+      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+      try (ObjectOutputStream out = new ObjectOutputStream(baos)) {
+        out.writeObject(limiter);
+      }
+
+      ByteArrayInputStream bais = new ByteArrayInputStream(baos.toByteArray());
+      try (ObjectInputStream in = new ObjectInputStream(bais)) {
+        Function<String, String> deserialized = (Function<String, String>) in.readObject();
+        Assertions.assertEquals(limiter.toString(), deserialized.toString());
+      }
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  @Test
+  public void firstSerializability() {
+    Function<String, String> limiter = CardinalityLimiters.first(2);
+    limiter.apply("a");
+    limiter.apply("b");
+    limiter.apply("c");
+    checkSerde(limiter);
+  }
+
+  @Test
+  public void mostFrequentSerializability() {
+    Function<String, String> limiter = CardinalityLimiters.mostFrequent(2);
+    limiter.apply("a");
+    limiter.apply("b");
+    limiter.apply("c");
+    checkSerde(limiter);
+  }
+
+  @Test
+  public void rollupSerializability() {
+    Function<String, String> limiter = CardinalityLimiters.rollup(2);
+    limiter.apply("a");
+    limiter.apply("b");
+    limiter.apply("c");
+    checkSerde(limiter);
+  }
+
+  @Test
+  public void registeredNameOrIpSerializability() {
+    Function<String, String> registeredNamelimiter = CardinalityLimiters.first(5);
+    Function<String, String> ipNamelimiter = CardinalityLimiters.first(2);
+    Function<String, String> limiter = CardinalityLimiters.registeredNameOrIp(registeredNamelimiter, ipNamelimiter);
+
+    limiter.apply("127.0.0.1");
+    limiter.apply("[::1]");
+    limiter.apply("example.com");
+
+    checkSerde(limiter);
+  }
+}

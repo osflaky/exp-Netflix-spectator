@@ -1,0 +1,584 @@
+/*
+ * Copyright 2014-2019 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.netflix.spectator.aws2;
+
+import com.netflix.spectator.api.Counter;
+import com.netflix.spectator.api.DefaultRegistry;
+import com.netflix.spectator.api.Id;
+import com.netflix.spectator.api.ManualClock;
+import com.netflix.spectator.api.Registry;
+import com.netflix.spectator.api.Timer;
+import com.netflix.spectator.api.Utils;
+import com.netflix.spectator.ipc.IpcMetric;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.reactivestreams.Publisher;
+import software.amazon.awssdk.awscore.AwsExecutionAttribute;
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.SdkRequest;
+import software.amazon.awssdk.core.SdkResponse;
+import software.amazon.awssdk.core.async.AsyncRequestBody;
+import software.amazon.awssdk.core.interceptor.Context;
+import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
+import software.amazon.awssdk.core.interceptor.SdkExecutionAttribute;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.http.SdkHttpMethod;
+import software.amazon.awssdk.http.SdkHttpRequest;
+import software.amazon.awssdk.http.SdkHttpResponse;
+import software.amazon.awssdk.regions.Region;
+
+import java.io.InputStream;
+import java.net.ConnectException;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+public class SpectatorExecutionInterceptorTest {
+
+  private static final int RETRIES = 3;
+
+  private ManualClock clock;
+  private Registry registry;
+  private SpectatorExecutionInterceptor interceptor;
+
+  @BeforeEach
+  public void before() {
+    clock = new ManualClock();
+    registry = new DefaultRegistry(clock);
+    interceptor = new SpectatorExecutionInterceptor(registry);
+  }
+
+  @AfterEach
+  public void after() {
+    IpcMetric.validate(registry, true);
+  }
+
+  private void execute(TestContext context, ExecutionAttributes attrs, long latency) {
+    interceptor.beforeExecution(context, attrs);
+    interceptor.modifyRequest(context, attrs);
+    interceptor.beforeMarshalling(context, attrs);
+    interceptor.afterMarshalling(context, attrs);
+    interceptor.modifyHttpRequest(context, attrs);
+    interceptor.beforeTransmission(context, attrs);
+    clock.setMonotonicTime(latency);
+    if (context.httpResponse() == null) {
+      // Simulate network failure with no response received
+      for (int i = 0; i < RETRIES; ++i) {
+        interceptor.beforeTransmission(context, attrs);
+        clock.setMonotonicTime(clock.monotonicTime() + latency);
+      }
+      interceptor.onExecutionFailure(context.failureContext(), attrs);
+    } else {
+      interceptor.afterTransmission(context, attrs);
+      interceptor.modifyHttpResponse(context, attrs);
+      interceptor.beforeUnmarshalling(context, attrs);
+      if (context.isFailure()) {
+        interceptor.onExecutionFailure(context.failureContext(), attrs);
+      } else {
+        interceptor.afterUnmarshalling(context, attrs);
+        interceptor.modifyResponse(context, attrs);
+        interceptor.afterExecution(context, attrs);
+      }
+    }
+  }
+
+  private ExecutionAttributes createAttributes(String service, String op) {
+    return createAttributes(service, op, Region.US_EAST_1, "123456789012");
+  }
+
+  private ExecutionAttributes createAttributes(
+      String service, String op, Region region, String accountId) {
+    ExecutionAttributes attrs = new ExecutionAttributes();
+    attrs.putAttribute(SdkExecutionAttribute.SERVICE_NAME, service);
+    attrs.putAttribute(SdkExecutionAttribute.OPERATION_NAME, op);
+    if (region != null) {
+      attrs.putAttribute(AwsExecutionAttribute.AWS_REGION, region);
+    }
+    if (accountId != null) {
+      attrs.putAttribute(AwsExecutionAttribute.AWS_AUTH_ACCOUNT_ID, accountId);
+    }
+    return attrs;
+  }
+
+  private String get(Id id, String k) {
+    return Utils.getTagValue(id, k);
+  }
+
+  private long millis(long v) {
+    return TimeUnit.MILLISECONDS.toNanos(v);
+  }
+
+  private Counter findCounter(String name) {
+    return registry.counters()
+        .filter(c -> c.id().name().equals(name))
+        .findFirst()
+        .orElse(null);
+  }
+
+  @Test
+  public void successfulRequest() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(200)
+        .build();
+    TestContext context = new TestContext(request, response);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(42));
+    Assertions.assertEquals(1, registry.timers().count());
+
+    Timer t = registry.timers().findFirst().orElse(null);
+    Assertions.assertNotNull(t);
+    Assertions.assertEquals(1, t.count());
+    Assertions.assertEquals(millis(42), t.totalTime());
+    Assertions.assertEquals("EC2.DescribeInstances", get(t.id(), "ipc.endpoint"));
+    Assertions.assertEquals("200", get(t.id(), "http.status"));
+    Assertions.assertEquals("post", get(t.id(), "http.method"));
+  }
+
+  @Test
+  public void networkFailure() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    Throwable error = new ConnectException("failed to connect");
+    TestContext context = new TestContext(request, null, error);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+    Assertions.assertEquals(2, registry.timers().count());
+
+    registry.timers().forEach(t -> {
+      Assertions.assertEquals("EC2.DescribeInstances", get(t.id(), "ipc.endpoint"));
+      switch ((int) t.count()) {
+        case 1:
+          Assertions.assertEquals("connection_error", get(t.id(), "ipc.status"));
+          Assertions.assertEquals("ConnectException", get(t.id(), "ipc.status.detail"));
+          break;
+        case 3:
+          // Captured for the retries attempts, we do not know the exception so it should have
+          // an unexpected status
+          Assertions.assertEquals("unexpected_error", get(t.id(), "ipc.status"));
+          break;
+        default:
+          Assertions.fail("unexpected count: " + t.id() + " = " + t.count());
+      }
+    });
+  }
+
+  @Test
+  public void awsFailure() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(403)
+        .build();
+    Throwable error = AwsServiceException.builder()
+        .awsErrorDetails(AwsErrorDetails.builder()
+            .errorCode("AccessDenied")
+            .errorMessage("credentials have expired")
+            .build())
+        .build();
+    TestContext context = new TestContext(request, response, error);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+    Assertions.assertEquals(1, registry.timers().count());
+
+    Timer t = registry.timers().findFirst().orElse(null);
+    Assertions.assertNotNull(t);
+    Assertions.assertEquals(1, t.count());
+    Assertions.assertEquals(millis(30), t.totalTime());
+    Assertions.assertEquals("403", get(t.id(), "http.status"));
+    Assertions.assertEquals("AccessDenied", get(t.id(), "ipc.status.detail"));
+  }
+
+  @Test
+  public void awsThrottling() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(400)
+        .build();
+    Throwable error = AwsServiceException.builder()
+        .awsErrorDetails(AwsErrorDetails.builder()
+            .errorCode("Throttling")
+            .errorMessage("too many requests")
+            .build())
+        .build();
+    TestContext context = new TestContext(request, response, error);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+    Assertions.assertEquals(1, registry.timers().count());
+
+    Timer t = registry.timers().findFirst().orElse(null);
+    Assertions.assertNotNull(t);
+    Assertions.assertEquals(1, t.count());
+    Assertions.assertEquals(millis(30), t.totalTime());
+    Assertions.assertEquals("400", get(t.id(), "http.status"));
+    Assertions.assertEquals("throttled", get(t.id(), "ipc.status"));
+  }
+
+  private void parseRetryHeaderTest(String expected, String header) {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .appendHeader("amz-sdk-request", header)
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(200)
+        .build();
+    TestContext context = new TestContext(request, response);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+    Assertions.assertEquals(1, registry.timers().count());
+
+    Timer t = registry.timers().findFirst().orElse(null);
+    Assertions.assertNotNull(t);
+    Assertions.assertEquals(1, t.count());
+    Assertions.assertEquals(millis(30), t.totalTime());
+    Assertions.assertEquals(expected, get(t.id(), "ipc.attempt"));
+  }
+
+  @Test
+  public void parseRetryHeaderInitial() {
+    parseRetryHeaderTest("initial", "attempt=1; max=4");
+  }
+
+  @Test
+  public void parseRetryHeaderSecond() {
+    parseRetryHeaderTest("second", "attempt=2; max=4");
+  }
+
+  @Test
+  public void parseRetryHeaderThird() {
+    parseRetryHeaderTest("third_up", "attempt=3; max=4");
+  }
+
+  @Test
+  public void parseRetryHeader50() {
+    parseRetryHeaderTest("third_up", "attempt=50; max=50");
+  }
+
+  @Test
+  public void parseRetryHeaderInvalidNumber() {
+    parseRetryHeaderTest("unknown", "attempt=foo; max=bar");
+  }
+
+  @Test
+  public void parseRetryHeaderBadFormat() {
+    parseRetryHeaderTest("unknown", "foo");
+  }
+
+  @Test
+  public void requestCountSuccess() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(200)
+        .build();
+    TestContext context = new TestContext(request, response);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(42));
+
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("EC2", get(c.id(), "aws.service"));
+    Assertions.assertEquals("DescribeInstances", get(c.id(), "aws.op"));
+    Assertions.assertEquals("us-east-1", get(c.id(), "aws.region"));
+    Assertions.assertEquals("123456789012", get(c.id(), "aws.account"));
+    Assertions.assertEquals("success", get(c.id(), "result"));
+  }
+
+  @Test
+  public void requestCountFailure() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(403)
+        .build();
+    Throwable error = AwsServiceException.builder()
+        .awsErrorDetails(AwsErrorDetails.builder()
+            .errorCode("AccessDenied")
+            .errorMessage("credentials have expired")
+            .build())
+        .build();
+    TestContext context = new TestContext(request, response, error);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("failure", get(c.id(), "result"));
+  }
+
+  @Test
+  public void requestCountThrottled() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(400)
+        .build();
+    Throwable error = AwsServiceException.builder()
+        .awsErrorDetails(AwsErrorDetails.builder()
+            .errorCode("Throttling")
+            .errorMessage("too many requests")
+            .build())
+        .build();
+    TestContext context = new TestContext(request, response, error);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("throttled", get(c.id(), "result"));
+  }
+
+  @Test
+  public void requestCountNoRegionOrAccount() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(200)
+        .build();
+    TestContext context = new TestContext(request, response);
+    execute(context, createAttributes("EC2", "DescribeInstances", null, null), millis(42));
+
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("EC2", get(c.id(), "aws.service"));
+    Assertions.assertEquals("unknown", get(c.id(), "aws.region"));
+    Assertions.assertEquals("unknown", get(c.id(), "aws.account"));
+  }
+
+  @Test
+  public void requestCountNetworkFailure() {
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    Throwable error = new ConnectException("failed to connect");
+    TestContext context = new TestContext(request, null, error);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("failure", get(c.id(), "result"));
+  }
+
+  @Test
+  public void preTransmissionFailure() {
+    // Failure occurs before beforeTransmission runs (e.g. marshalling, endpoint/credentials
+    // resolution, or signing), so the log entry attribute was never populated. This must not
+    // throw an NPE and mask the underlying exception.
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    Throwable error = new IllegalStateException("unable to resolve endpoint");
+    TestContext context = new TestContext(request, null, error);
+    ExecutionAttributes attrs = createAttributes("EC2", "DescribeInstances");
+    interceptor.onExecutionFailure(context.failureContext(), attrs);
+
+    // No IPC log entry / timer since no attempt was made, but the failure is still counted.
+    Assertions.assertEquals(0, registry.timers().count());
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("failure", get(c.id(), "result"));
+  }
+
+  @Test
+  public void preTransmissionServiceException() {
+    // A service exception (here throttling) surfacing before transmission must also avoid the
+    // NPE while still classifying the result correctly.
+    Throwable error = AwsServiceException.builder()
+        .awsErrorDetails(AwsErrorDetails.builder()
+            .errorCode("Throttling")
+            .errorMessage("too many requests")
+            .build())
+        .build();
+    TestContext context = new TestContext(null, null, error);
+    ExecutionAttributes attrs = createAttributes("EC2", "DescribeInstances");
+    interceptor.onExecutionFailure(context.failureContext(), attrs);
+
+    Assertions.assertEquals(0, registry.timers().count());
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("throttled", get(c.id(), "result"));
+  }
+
+  @Test
+  public void awsFailureWithoutErrorDetails() {
+    // A throttling error can be classified via status code alone, leaving awsErrorDetails null.
+    // The log entry is present (transmission occurred), so withStatusDetail must not NPE on the
+    // missing details.
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(429)
+        .build();
+    Throwable error = AwsServiceException.builder()
+        .statusCode(429)
+        .build();
+    TestContext context = new TestContext(request, response, error);
+    execute(context, createAttributes("EC2", "DescribeInstances"), millis(30));
+    Assertions.assertEquals(1, registry.timers().count());
+
+    Timer t = registry.timers().findFirst().orElse(null);
+    Assertions.assertNotNull(t);
+    Assertions.assertEquals(1, t.count());
+    Assertions.assertEquals("throttled", get(t.id(), "ipc.status"));
+  }
+
+  @Test
+  public void afterTransmissionWithoutLogEntry() {
+    // afterTransmission invoked without a preceding beforeTransmission must not throw.
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(200)
+        .build();
+    TestContext context = new TestContext(request, response);
+    ExecutionAttributes attrs = createAttributes("EC2", "DescribeInstances");
+    interceptor.afterTransmission(context, attrs);
+
+    Assertions.assertEquals(0, registry.timers().count());
+  }
+
+  @Test
+  public void afterExecutionWithoutLogEntry() {
+    // afterExecution invoked without a preceding beforeTransmission must not throw, but should
+    // still count the successful request.
+    SdkHttpRequest request = SdkHttpRequest.builder()
+        .method(SdkHttpMethod.POST)
+        .uri(URI.create("https://ec2.us-east-1.amazonaws.com"))
+        .build();
+    SdkHttpResponse response = SdkHttpResponse.builder()
+        .statusCode(200)
+        .build();
+    TestContext context = new TestContext(request, response);
+    ExecutionAttributes attrs = createAttributes("EC2", "DescribeInstances");
+    interceptor.afterExecution(context, attrs);
+
+    Assertions.assertEquals(0, registry.timers().count());
+    Counter c = findCounter("aws.requests");
+    Assertions.assertNotNull(c);
+    Assertions.assertEquals(1, c.count());
+    Assertions.assertEquals("success", get(c.id(), "result"));
+  }
+
+  private static class TestContext implements Context.AfterExecution {
+
+    private SdkHttpRequest request;
+    private SdkHttpResponse response;
+    private Throwable error;
+
+    public TestContext(SdkHttpRequest request, SdkHttpResponse response) {
+      this(request, response, null);
+    }
+
+    public TestContext(SdkHttpRequest request, SdkHttpResponse response, Throwable error) {
+      this.request = request;
+      this.response = response;
+      this.error = error;
+    }
+
+    @Override public SdkResponse response() {
+      return null;
+    }
+
+    @Override public SdkHttpResponse httpResponse() {
+      return response;
+    }
+
+    @Override public Optional<Publisher<ByteBuffer>> responsePublisher() {
+      return Optional.empty();
+    }
+
+    @Override public Optional<InputStream> responseBody() {
+      return Optional.empty();
+    }
+
+    @Override public SdkHttpRequest httpRequest() {
+      return request;
+    }
+
+    @Override public Optional<RequestBody> requestBody() {
+      return Optional.empty();
+    }
+
+    @Override public Optional<AsyncRequestBody> asyncRequestBody() {
+      return Optional.empty();
+    }
+
+    @Override public SdkRequest request() {
+      return null;
+    }
+
+    boolean isFailure() {
+      return error != null;
+    }
+
+    Context.FailedExecution failureContext() {
+      return new Context.FailedExecution() {
+        @Override
+        public Throwable exception() {
+          return error;
+        }
+
+        @Override
+        public SdkRequest request() {
+          return null;
+        }
+
+        @Override
+        public Optional<SdkHttpRequest> httpRequest() {
+          return Optional.ofNullable(request);
+        }
+
+        @Override
+        public Optional<SdkHttpResponse> httpResponse() {
+          return Optional.ofNullable(response);
+        }
+
+        @Override
+        public Optional<SdkResponse> response() {
+          return Optional.empty();
+        }
+      };
+    }
+  }
+}
